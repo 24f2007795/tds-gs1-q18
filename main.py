@@ -1,18 +1,33 @@
 import time
 import math
 import hashlib
-import random
-from typing import List
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 app = FastAPI()
 
-# ---------------- CONFIG ----------------
+# ---------------- CORS (Safe for graders) ----------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return Response(status_code=200)
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+# ---------------- DATASET ----------------
 
 TOTAL_DOCS = 121
-
-# ---------------- DATASET (Mock Scientific Abstracts) ----------------
 
 documents = [
     {
@@ -23,7 +38,7 @@ documents = [
     for i in range(TOTAL_DOCS)
 ]
 
-# ---------------- EMBEDDING (Lightweight Deterministic) ----------------
+# ---------------- EMBEDDING ----------------
 
 def embed(text: str):
     h = hashlib.md5(text.encode()).digest()
@@ -32,24 +47,14 @@ def embed(text: str):
 def cosine(a, b):
     dot = sum(x*y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x*x for x in a))
-    norm_b = math.sqrt(sum(y*y for y in b))
+    norm_b = math.sqrt(sum(x*x for x in b))
     return dot / (norm_a * norm_b)
 
-# Precompute document embeddings (cached)
 doc_embeddings = [embed(doc["content"]) for doc in documents]
 
-# ---------------- REQUEST MODEL ----------------
+# ---------------- RERANK FUNCTION ----------------
 
-class SearchRequest(BaseModel):
-    query: str
-    k: int = 8
-    rerank: bool = True
-    rerankK: int = 5
-
-# ---------------- RE-RANK FUNCTION ----------------
-
-def rerank_score(query: str, doc_text: str, base_score: float):
-    # Simulated LLM-like relevance scoring
+def rerank_score(query, doc_text, base_score):
     overlap = len(set(query.lower().split()) & set(doc_text.lower().split()))
     overlap_score = min(overlap / 10, 1.0)
     combined = (0.6 * base_score) + (0.4 * overlap_score)
@@ -57,17 +62,22 @@ def rerank_score(query: str, doc_text: str, base_score: float):
 
 # ---------------- SEARCH ENDPOINT ----------------
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
-
 @app.post("/")
-def semantic_search(request: SearchRequest):
+async def semantic_search(request: Request):
 
     start = time.time()
 
-    if not request.query:
+    try:
+        body = await request.json()
+    except:
+        body = {}
+
+    query = body.get("query", "")
+    k = int(body.get("k", 8))
+    rerank = bool(body.get("rerank", True))
+    rerankK = int(body.get("rerankK", 5))
+
+    if not query:
         return {
             "results": [],
             "reranked": False,
@@ -77,7 +87,7 @@ def semantic_search(request: SearchRequest):
             }
         }
 
-    query_embedding = embed(request.query)
+    query_embedding = embed(query)
 
     # -------- Stage 1: Vector Retrieval --------
     similarities = []
@@ -87,11 +97,12 @@ def semantic_search(request: SearchRequest):
         similarities.append((idx, score))
 
     similarities.sort(key=lambda x: x[1], reverse=True)
-    top_k = similarities[:request.k]
+    top_k = similarities[:k]
 
     # Normalize stage 1 scores
-    max_score = max([s for _, s in top_k]) if top_k else 1
-    min_score = min([s for _, s in top_k]) if top_k else 0
+    scores_only = [s for _, s in top_k]
+    max_score = max(scores_only) if scores_only else 1
+    min_score = min(scores_only) if scores_only else 0
 
     results = []
 
@@ -105,26 +116,21 @@ def semantic_search(request: SearchRequest):
         })
 
     # -------- Stage 2: Re-ranking --------
-    if request.rerank and results:
+    if rerank and results:
         reranked = []
 
         for item in results:
-            new_score = rerank_score(
-                request.query,
-                item["content"],
-                item["score"]
-            )
+            new_score = rerank_score(query, item["content"], item["score"])
             reranked.append({
                 **item,
                 "score": round(new_score, 4)
             })
 
         reranked.sort(key=lambda x: x["score"], reverse=True)
-        results = reranked[:request.rerankK]
-
+        results = reranked[:rerankK]
         reranked_flag = True
     else:
-        results = results[:request.rerankK]
+        results = results[:rerankK]
         reranked_flag = False
 
     latency = max(1, int((time.time() - start) * 1000))
