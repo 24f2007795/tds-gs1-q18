@@ -57,6 +57,11 @@ def rerank_score(query: str, doc_text: str, base_score: float):
 
 # ---------------- SEARCH ENDPOINT ----------------
 
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/")
 def semantic_search(request: SearchRequest):
 
